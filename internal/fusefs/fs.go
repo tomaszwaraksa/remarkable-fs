@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -338,8 +339,10 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 
 	// Clean up any active uncommitted upload buffer
 	if chInode := d.GetChild(name); chInode != nil {
-		if fn, isFile := chInode.Operations().(*FileNode); isFile && fn.uploadHandle != nil {
-			fn.uploadHandle.cleanupLocked()
+		if fn, isFile := chInode.Operations().(*FileNode); isFile {
+			if h := fn.uploadHandle.Load(); h != nil {
+				h.cleanupLocked()
+			}
 		}
 	}
 
@@ -601,9 +604,11 @@ func (d *DirNode) Create(ctx context.Context, name string, flags uint32, mode ui
 		repo:             d.repo,
 		syncer:           d.syncer,
 		mountPoint:       d.mountPoint,
+		uploadEmpty:      true,
+		existingSize:     -1,
 		isTemporary:      isTemp,
 	}
-	fileNode.uploadHandle = handle
+	fileNode.uploadHandle.Store(handle)
 
 	chInode := d.NewPersistentInode(ctx, fileNode, fs.StableAttr{Mode: fuse.S_IFREG})
 	addNode(d.fsNode, node)
@@ -699,8 +704,12 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 		}
 	}
 
-	if fileNode != nil && fileNode.uploadHandle != nil && fileNode.uploadHandle.lockIfUncommitted() {
-		handle := fileNode.uploadHandle
+	var staging *UploadFileHandle
+	if fileNode != nil {
+		staging = fileNode.uploadHandle.Load()
+	}
+	if staging != nil && staging.lockIfUncommitted() {
+		handle := staging
 		defer handle.mu.Unlock()
 
 		fileType, isDoc := isSupportedDocumentExtension(newName)
@@ -813,8 +822,10 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 
 	// The document may still be open for writing, with writes since its upload that go to the
 	// tablet at the next close: that upload must use the new name and folder.
-	if fileNode != nil && fileNode.uploadHandle != nil {
-		fileNode.uploadHandle.moved(newName, targetParentUUID, targetDir)
+	if fileNode != nil {
+		if h := fileNode.uploadHandle.Load(); h != nil {
+			h.moved(newName, targetParentUUID, targetDir)
+		}
 	}
 
 	logger.Info("Successfully renamed document to \"%s\"", newName)
@@ -883,7 +894,7 @@ type FileNode struct {
 	mountPoint       string
 	maxUploadSize    int64
 	textUploadFormat string
-	uploadHandle     *UploadFileHandle
+	uploadHandle     atomic.Pointer[UploadFileHandle] // the open upload of this document, if any
 }
 
 var _ fs.NodeGetattrer = (*FileNode)(nil)
@@ -900,11 +911,13 @@ func (f *FileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 	if ufh, ok := fh.(*UploadFileHandle); ok {
 		return ufh.Setattr(ctx, in, out)
 	}
-	if f.uploadHandle != nil {
-		return f.uploadHandle.Setattr(ctx, in, out)
+	if h := f.uploadHandle.Load(); h != nil {
+		return h.Setattr(ctx, in, out)
 	}
 
-	// Handle standalone truncate() calls without prior Open
+	// A standalone truncate() of a closed document (0.ideas.md C15): to its own size, nothing to
+	// do; to 0, the document is emptied on the tablet, like opening it with O_TRUNC; any other
+	// size would leave a broken PDF or EPUB, so it's refused.
 	if in.Valid&fuse.FATTR_SIZE != 0 {
 		if info.IsNotebook {
 			logger.Error("Cannot truncate reMarkable notebook \"%s\"", vpath)
@@ -913,6 +926,13 @@ func (f *FileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 		if info.FileType != "pdf" && info.FileType != "epub" && info.FileType != "txt" && info.FileType != "md" {
 			logger.Error("Cannot truncate file \"%s\": unsupported format", vpath)
 			return syscall.EINVAL
+		}
+		if int64(in.Size) == info.Size || int64(in.Size) == shownSize(info) {
+			return f.Getattr(ctx, fh, out)
+		}
+		if in.Size != 0 {
+			logger.Error("Cannot truncate \"%s\" to %d bytes: documents on the tablet can only be emptied (truncated to 0)", vpath, in.Size)
+			return syscall.EOPNOTSUPP
 		}
 
 		tmpFile, err := os.CreateTemp("", fmt.Sprintf("rm_upload_%s_*.tmp", info.UUID))
@@ -940,10 +960,18 @@ func (f *FileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAt
 			repo:             f.repo,
 			syncer:           f.syncer,
 			mountPoint:       f.mountPoint,
+			uploadEmpty:      true,
+			existingSize:     -1,
 			isTemporary:      false,
 		}
-		f.uploadHandle = handle
-		return handle.Setattr(ctx, in, out)
+		logger.Action("Emptying \"%s\" (UUID: %s) on reMarkable (truncated to 0)...", vpath, info.UUID)
+		handle.mu.Lock()
+		defer handle.mu.Unlock()
+		defer handle.cleanupLocked()
+		if errno := handle.commitLocked(ctx); errno != 0 {
+			return errno
+		}
+		return f.Getattr(ctx, fh, out)
 	}
 
 	return f.Getattr(ctx, fh, out)
@@ -967,6 +995,18 @@ func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
 
+	out.Size = uint64(shownSize(info))
+	if !info.ModTime.IsZero() {
+		out.Mtime = uint64(info.ModTime.Unix())
+		out.Atime = out.Mtime
+		out.Ctime = out.Mtime
+	}
+	return 0
+}
+
+// shownSize is the size the folder shows for a document: for notebooks and annotated PDFs,
+// the rendered PDF's once it's been rendered.
+func shownSize(info nodeInfo) int64 {
 	size := info.Size
 	if info.IsNotebook || info.HasAnnotations {
 		cacheMgr := converter.GetCache()
@@ -976,14 +1016,7 @@ func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 			}
 		}
 	}
-
-	out.Size = uint64(size)
-	if !info.ModTime.IsZero() {
-		out.Mtime = uint64(info.ModTime.Unix())
-		out.Atime = out.Mtime
-		out.Ctime = out.Mtime
-	}
-	return 0
+	return size
 }
 
 // Statfs returns filesystem statistics for virtual files.
@@ -1035,9 +1068,11 @@ func (f *FileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 			repo:             f.repo,
 			syncer:           f.syncer,
 			mountPoint:       f.mountPoint,
+			uploadEmpty:      flags&syscall.O_TRUNC != 0, // the kernel usually truncates separately, see Setattr
+			existingSize:     shownSize(info),
 			isTemporary:      false,
 		}
-		f.uploadHandle = handle
+		f.uploadHandle.Store(handle)
 		logger.Action("Initiated overwrite upload buffering for \"%s\" (UUID: %s)", vpath, info.UUID)
 		return handle, 0, 0
 	}
@@ -1390,8 +1425,15 @@ type UploadFileHandle struct {
 	// dirty: data was written (or the size changed) since the last upload, or since opening.
 	// A close uploads only then: shell redirection closes a copy of the file once before
 	// writing anything, and writes after an upload must reach the tablet too (0.ideas.md C13).
-	dirty       bool
-	isTemporary bool
+	dirty bool
+	// uploadEmpty: upload at the last close even if nothing was written, because the empty file
+	// is what was asked for: a new file, or a document opened with O_TRUNC. Not for a document
+	// merely opened for writing (touch), which stays as it is (0.ideas.md C16).
+	uploadEmpty bool
+	// existingSize: for an existing document opened for writing, its size on the tablet (the
+	// buffer starts empty, without its content); -1 for a new file.
+	existingSize int64
+	isTemporary  bool
 }
 
 // go-fuse interface assertions for upload file operations:
@@ -1465,6 +1507,24 @@ func (h *UploadFileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// An existing document with nothing written to it yet: its content isn't in the buffer, so
+	// only emptying it (O_TRUNC, truncate to 0) or keeping its size make sense (0.ideas.md C15/C16).
+	if in.Valid&fuse.FATTR_SIZE != 0 && h.existingSize >= 0 && !h.dirty && !h.committed && h.size == 0 {
+		switch {
+		case in.Size == 0:
+			h.uploadEmpty = true
+		case int64(in.Size) == h.existingSize: // what the folder shows for it
+			out.Mode = fuse.S_IFREG | 0644
+			out.Uid = uint32(os.Getuid())
+			out.Gid = uint32(os.Getgid())
+			out.Size = in.Size
+			return 0
+		default:
+			logger.Error("Cannot truncate \"%s\" to %d bytes: documents on the tablet can only be emptied (truncated to 0)", h.name, in.Size)
+			return syscall.EOPNOTSUPP
+		}
+	}
+
 	if in.Valid&fuse.FATTR_SIZE != 0 {
 		if h.maxSize > 0 && int64(in.Size) > h.maxSize {
 			logger.Error("Upload size limit exceeded for \"%s\" in truncate: %d bytes > %d bytes limit",
@@ -1525,20 +1585,61 @@ func (h *UploadFileHandle) Flush(ctx context.Context) syscall.Errno {
 	return h.commitLocked(ctx)
 }
 
-// Release follows the last close: it uploads anything still unsent (also a file left empty,
-// which was never uploaded) and removes the local buffer.
+// Release follows the last close: it uploads anything still unsent (also a new file left
+// empty, see uploadEmpty) and removes the local buffer. close() has already returned, so a
+// failed upload can't be reported to the program: the written file is kept instead.
 func (h *UploadFileHandle) Release(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if !h.isTemporary && (!h.committed || h.dirty) {
-		_ = h.commitLocked(ctx)
+	if !h.isTemporary && (h.dirty || (!h.committed && h.uploadEmpty)) {
+		if errno := h.commitLocked(ctx); errno != 0 {
+			h.keepUnsentLocked()
+		}
 	}
 	if h.committed || !h.isTemporary {
 		h.cleanupLocked()
 	}
 
 	return 0
+}
+
+// keepUnsentLocked saves what was written, which couldn't be uploaded, in
+// ~/.cache/remarkable-fs/unsent/, so nothing is lost silently (0.ideas.md C14).
+func (h *UploadFileHandle) keepUnsentLocked() {
+	if h.tmpPath == "" || h.size == 0 {
+		return
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		cache = os.TempDir()
+	}
+	dir := filepath.Join(cache, "remarkable-fs", "unsent")
+	dest := filepath.Join(dir, time.Now().Format("2006-01-02 15.04.05.000")+" "+h.name)
+	if err = os.MkdirAll(dir, 0700); err == nil {
+		if err = copyFile(h.tmpPath, dest); err == nil {
+			logger.Error("Couldn't upload \"%s\" to the tablet; what was written is kept in %s. Copy it into the folder again once the tablet is connected.", h.name, dest)
+			return
+		}
+	}
+	logger.Error("Couldn't upload \"%s\" to the tablet, and couldn't keep a copy in %s either: %v", h.name, dir, err)
+}
+
+// copyFile copies from into a new file to; it never overwrites one.
+func copyFile(from, to string) error {
+	data, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := out.Write(data); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // lockIfUncommitted takes the handle's lock if it was never uploaded (a staging file, or a
@@ -1814,6 +1915,10 @@ func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 }
 
 func (h *UploadFileHandle) cleanupLocked() {
+	// Done with this upload: later truncates and opens of the document start afresh (C15).
+	if h.fileNode != nil {
+		h.fileNode.uploadHandle.CompareAndSwap(h, nil)
+	}
 	if h.tmpFile != nil {
 		_ = h.tmpFile.Close()
 		h.tmpFile = nil

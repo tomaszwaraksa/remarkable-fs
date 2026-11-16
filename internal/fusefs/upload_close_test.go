@@ -73,6 +73,24 @@ func TestUploadKeepsWritesAroundCloses(t *testing.T) {
 		}
 		return info.Size()
 	}
+	// newBuffers lists upload buffers made since the test started and still there.
+	before := map[string]bool{}
+	buffers := func() []string {
+		found, _ := filepath.Glob(filepath.Join(os.TempDir(), "rm_upload_*"))
+		return found
+	}
+	for _, b := range buffers() {
+		before[b] = true
+	}
+	newBuffers := func() []string {
+		var left []string
+		for _, b := range buffers() {
+			if !before[b] {
+				left = append(left, b)
+			}
+		}
+		return left
+	}
 	// settle waits for the release of the last close, which reaches the filesystem after close()
 	// has returned, so a wrong extra upload there would show up in the checks.
 	settle := func() { time.Sleep(300 * time.Millisecond) }
@@ -145,6 +163,73 @@ func TestUploadKeepsWritesAroundCloses(t *testing.T) {
 		}
 	})
 
+	t.Run("an existing document opened for writing without writing stays as it is (C16)", func(t *testing.T) {
+		shell(`touch Once.pdf; exec 3>>Once.pdf; exec 3>&-`)
+		settle()
+		if got := uploads("Once.pdf"); !equal(got, len(pdf)) {
+			t.Errorf("Expected no new upload, got %v", got)
+		}
+		if got := size("Once.pdf"); got != int64(len(pdf)) {
+			t.Errorf("Expected Once.pdf to keep its %d bytes, got %d", len(pdf), got)
+		}
+	})
+
+	t.Run("an existing document emptied with O_TRUNC is emptied, once (C16)", func(t *testing.T) {
+		shell(`: > Twice.pdf`)
+		settle()
+		if got := uploads("Twice.pdf"); !equal(got, 100, len(pdf), 0) {
+			t.Errorf("Expected a third upload of 0 bytes, got %v", got)
+		}
+	})
+
+	t.Run("truncate: own size nothing, other sizes refused, 0 empties the document (C15)", func(t *testing.T) {
+		// coreutils truncate opens the file and truncates it open; Python's os.truncate does it by name.
+		shell(`truncate -s ` + strconv.Itoa(len(pdf)) + ` Redirected.pdf
+			if truncate -s 10 Redirected.pdf 2>/dev/null; then echo "truncate -s 10 was allowed"; exit 1; fi
+			if python3 -c 'import os; os.truncate("Redirected.pdf", 10)' 2>/dev/null; then echo "os.truncate to 10 was allowed"; exit 1; fi`)
+		settle()
+		if got := uploads("Redirected.pdf"); !equal(got, len(pdf)) {
+			t.Errorf("Expected no new upload so far, got %v", got)
+		}
+		if got := size("Redirected.pdf"); got != int64(len(pdf)) {
+			t.Errorf("Expected Redirected.pdf to keep its %d bytes, got %d", len(pdf), got)
+		}
+		shell(`truncate -s 0 Redirected.pdf`)
+		settle()
+		if got := uploads("Redirected.pdf"); !equal(got, len(pdf), 0) {
+			t.Errorf("Expected an upload of 0 bytes (truncate -s 0), got %v", got)
+		}
+		shell(`python3 -c 'import os; os.truncate("Once.pdf", 0)'`)
+		settle()
+		if got := uploads("Once.pdf"); !equal(got, len(pdf), 0) {
+			t.Errorf("Expected an upload of 0 bytes (os.truncate), got %v", got)
+		}
+		for _, name := range []string{"Redirected.pdf", "Once.pdf"} {
+			if got := size(name); got != 0 {
+				t.Errorf("Expected %s to be empty, got %d bytes", name, got)
+			}
+		}
+		if left := newBuffers(); len(left) != 0 {
+			t.Errorf("Expected no upload buffers left behind, got %v", left)
+		}
+	})
+
+	t.Run("cat > and cp onto an existing document: one upload, the full content", func(t *testing.T) {
+		shell(`cat "$SAMPLE" > Redirected.pdf; cp "$SAMPLE" Once.pdf`)
+		settle()
+		if got := uploads("Redirected.pdf"); !equal(got, len(pdf), 0, len(pdf)) {
+			t.Errorf("Expected one more upload of %d bytes (no empty one first), got %v", len(pdf), got)
+		}
+		if got := uploads("Once.pdf"); !equal(got, len(pdf), 0, len(pdf)) {
+			t.Errorf("Expected one more upload of %d bytes, got %v", len(pdf), got)
+		}
+		for _, name := range []string{"Redirected.pdf", "Once.pdf"} {
+			if got := size(name); got != int64(len(pdf)) {
+				t.Errorf("Expected %s to be %d bytes, got %d", name, len(pdf), got)
+			}
+		}
+	})
+
 	t.Run("Markdown written again: converted again from the whole text", func(t *testing.T) {
 		shell(`exec 3>Notes.md; exec 4>&3; printf '# Notes\n\nFirst part.\n' >&3; exec 3>&-; printf '\nSecond part, which makes the book a good deal longer than before.\n' >&4; exec 4>&-`)
 		got := uploads("Notes.md")
@@ -166,4 +251,34 @@ func TestUploadKeepsWritesAroundCloses(t *testing.T) {
 			t.Errorf("Expected one upload of 0 bytes, got %v", got)
 		}
 	})
+}
+
+// An upload that fails at the last close can't be reported to the program any more: what was
+// written is kept in ~/.cache/remarkable-fs/unsent/ instead of being lost (0.ideas.md C14).
+func TestFailedUploadIsKept(t *testing.T) {
+	if _, err := logger.Init(filepath.Join(t.TempDir(), "log.txt"), false); err != nil {
+		t.Fatalf("Failed to init logger: %v", err)
+	}
+	defer logger.Close()
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+
+	tmp, err := os.CreateTemp(t.TempDir(), "rm_upload_*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmp.Close()
+	if _, err := tmp.WriteString("my notes"); err != nil {
+		t.Fatal(err)
+	}
+	h := &UploadFileHandle{name: "Notes.md", tmpFile: tmp, tmpPath: tmp.Name(), size: 8}
+	h.keepUnsentLocked()
+
+	kept, _ := filepath.Glob(filepath.Join(cache, "remarkable-fs", "unsent", "* Notes.md"))
+	if len(kept) != 1 {
+		t.Fatalf("Expected one kept copy of Notes.md, got %v", kept)
+	}
+	if data, _ := os.ReadFile(kept[0]); string(data) != "my notes" {
+		t.Errorf("Expected the kept copy to hold what was written, got %q", data)
+	}
 }
