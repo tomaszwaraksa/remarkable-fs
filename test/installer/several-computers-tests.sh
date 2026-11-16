@@ -54,7 +54,7 @@ daemon() {
     echo "remarkable-fs for $1 didn't show the tablet; its log:"; cat "$home/log.txt"; exit 1
 }
 
-# A small PDF, copied in with cp (shell redirection into the folder loses the content: 0.ideas.md C13).
+# A small PDF to upload.
 make_pdf() { printf '%%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 595 842]/Parent 2 0 R/Resources<<>>>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000052 00000 n \n0000000102 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n187\n%%%%EOF\n' > "$WORK/sample.pdf"; }
 documents() { podman exec tablet sh -c 'grep -ho "\"visibleName\": \"[^\"]*\"" /home/root/.local/share/remarkable/xochitl/*.metadata 2>/dev/null' | sed 's/.*: //' | sort | tr '\n' ' '; echo; }
 
@@ -74,7 +74,7 @@ env HOME="$WORK/one" PATH="$HERE/shims:$PATH" SHIM_DIR="$SD" bash -c "source '$S
 echo; echo "=== 3. another computer is in the middle of a change → this one waits for it (about 6 s)"
 podman exec -d tablet sh -c "mkdir -p /home/root/.cache && flock $LOCK sleep 6"
 sleep 1
-start=$(date +%s); cp "$WORK/sample.pdf" "$WORK/one/remarkable/Waited.pdf"; echo "upload took $(( $(date +%s) - start )) s"
+start=$(date +%s); cat "$WORK/sample.pdf" > "$WORK/one/remarkable/Waited.pdf"; echo "upload took $(( $(date +%s) - start )) s (by shell redirection)"
 grep -o 'Waiting for another computer[^.]*' "$WORK/one/log.txt" | head -1
 
 echo; echo "=== 4. both computers upload at the same time → both arrive, screen restarts one at a time"

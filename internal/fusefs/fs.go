@@ -699,8 +699,9 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 		}
 	}
 
-	if fileNode != nil && fileNode.uploadHandle != nil && !fileNode.uploadHandle.committed {
+	if fileNode != nil && fileNode.uploadHandle != nil && fileNode.uploadHandle.lockIfUncommitted() {
 		handle := fileNode.uploadHandle
+		defer handle.mu.Unlock()
 
 		fileType, isDoc := isSupportedDocumentExtension(newName)
 		if !isDoc {
@@ -721,7 +722,7 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 		handle.fileNode.virtualPath = path.Join(targetDir.virtualPath, newName)
 		model.UnlockTree()
 
-		if errno := handle.commit(ctx); errno != 0 {
+		if errno := handle.commitLocked(ctx); errno != 0 {
 			return errno
 		}
 		handle.cleanupLocked()
@@ -808,6 +809,12 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 				_ = d.syncer.SyncThumbnail(newFilePath, child.ModTime, pngBytes)
 			}
 		}
+	}
+
+	// The document may still be open for writing, with writes since its upload that go to the
+	// tablet at the next close: that upload must use the new name and folder.
+	if fileNode != nil && fileNode.uploadHandle != nil {
+		fileNode.uploadHandle.moved(newName, targetParentUUID, targetDir)
 	}
 
 	logger.Info("Successfully renamed document to \"%s\"", newName)
@@ -1380,7 +1387,11 @@ type UploadFileHandle struct {
 	mountPoint       string
 	textUploadFormat string
 	committed        bool
-	isTemporary      bool
+	// dirty: data was written (or the size changed) since the last upload, or since opening.
+	// A close uploads only then: shell redirection closes a copy of the file once before
+	// writing anything, and writes after an upload must reach the tablet too (0.ideas.md C13).
+	dirty       bool
+	isTemporary bool
 }
 
 // go-fuse interface assertions for upload file operations:
@@ -1436,6 +1447,7 @@ func (h *UploadFileHandle) Write(ctx context.Context, data []byte, off int64) (u
 		return 0, syscall.EIO
 	}
 
+	h.dirty = true
 	if targetEnd > h.size {
 		h.size = targetEnd
 		if h.fileNode != nil && h.fileNode.fsNode != nil {
@@ -1464,6 +1476,10 @@ func (h *UploadFileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out 
 				return syscall.EIO
 			}
 		}
+		// Only a real change counts: opening with O_TRUNC truncates the empty buffer to 0.
+		if int64(in.Size) != h.size {
+			h.dirty = true
+		}
 		h.size = int64(in.Size)
 		if h.fileNode != nil && h.fileNode.fsNode != nil {
 			model.LockTree()
@@ -1491,7 +1507,9 @@ func (h *UploadFileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) sysca
 	return 0
 }
 
-// Flush is invoked on close(fd) and commits the upload to the tablet if not a temporary staging file.
+// Flush is invoked on every close(fd) and uploads to the tablet what was written since the last
+// upload (temporary staging files wait for their rename). Nothing new written: nothing to do, so
+// a close before any writes (shell redirection) doesn't upload an empty document.
 func (h *UploadFileHandle) Flush(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1500,41 +1518,51 @@ func (h *UploadFileHandle) Flush(ctx context.Context) syscall.Errno {
 		_ = h.tmpFile.Sync()
 	}
 
-	// Do not commit temporary staging files until renamed
-	if h.isTemporary {
+	if h.isTemporary || !h.dirty {
 		return 0
 	}
 
 	return h.commitLocked(ctx)
 }
 
-// Release cleans up the local temporary buffer file.
+// Release follows the last close: it uploads anything still unsent (also a file left empty,
+// which was never uploaded) and removes the local buffer.
 func (h *UploadFileHandle) Release(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if !h.committed && !h.isTemporary {
+	if !h.isTemporary && (!h.committed || h.dirty) {
 		_ = h.commitLocked(ctx)
-		h.cleanupLocked()
-	} else if h.committed {
+	}
+	if h.committed || !h.isTemporary {
 		h.cleanupLocked()
 	}
 
 	return 0
 }
 
-func (h *UploadFileHandle) commit(ctx context.Context) syscall.Errno {
+// lockIfUncommitted takes the handle's lock if it was never uploaded (a staging file, or a
+// file not closed yet) and says so; otherwise it leaves the lock free.
+func (h *UploadFileHandle) lockIfUncommitted() bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.commitLocked(ctx)
+	if h.committed {
+		h.mu.Unlock()
+		return false
+	}
+	return true
 }
 
-// commitLocked uploads the buffered file to reMarkable tablet, writes metadata/content/pagedata, and notifies xochitl.
-func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
-	if h.committed {
-		return 0
-	}
+// moved follows a rename or move of the uploaded document, so a later upload keeps its new
+// name and folder.
+func (h *UploadFileHandle) moved(name, parentUUID string, dir *DirNode) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.name, h.parentUUID, h.dirNode = name, parentUUID, dir
+}
 
+// commitLocked uploads the buffered file to reMarkable tablet, writes metadata/content/pagedata, and
+// notifies xochitl. Called again after more writes, it uploads the document again, whole.
+func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 	if h.tmpFile == nil {
 		return 0
 	}
@@ -1555,8 +1583,10 @@ func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 
 	logger.Action("Uploading \"%s\" (%d bytes) to reMarkable tablet (UUID: %s)...", h.name, fileSize, h.uuid)
 
-	// 0. Handle on-the-fly conversion for txt and md
+	// 0. Handle on-the-fly conversion for txt and md, into a file of its own: the buffer keeps
+	// the text as written, so later writes and another upload start from it.
 	targetFileType := h.fileType
+	src, srcPath := h.tmpFile, h.tmpPath
 	if h.fileType == "txt" || h.fileType == "md" {
 		rawBytes, rErr := os.ReadFile(h.tmpPath)
 		if rErr != nil {
@@ -1594,19 +1624,20 @@ func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 			return syscall.EIO
 		}
 
-		if err := h.tmpFile.Truncate(0); err != nil {
-			logger.Error("Failed to truncate upload buffer: %v", err)
+		converted, err := os.CreateTemp("", fmt.Sprintf("rm_upload_%s_*.%s", h.uuid, targetFileType))
+		if err != nil {
+			logger.Error("Failed to create a buffer for the converted %s: %v", targetFileType, err)
 			return syscall.EIO
 		}
-		if _, err := h.tmpFile.Seek(0, io.SeekStart); err != nil {
-			logger.Error("Failed to rewind upload buffer: %v", err)
-			return syscall.EIO
-		}
-		if _, err := h.tmpFile.Write(convertedBytes); err != nil {
+		defer func() {
+			_ = converted.Close()
+			_ = os.Remove(converted.Name())
+		}()
+		if _, err := converted.Write(convertedBytes); err != nil {
 			logger.Error("Failed to write converted %s to upload buffer: %v", targetFileType, err)
 			return syscall.EIO
 		}
-		_ = h.tmpFile.Sync()
+		src, srcPath = converted, converted.Name()
 
 		fileSize = int64(len(convertedBytes))
 		logger.Action("Converted %s (\"%s\") on-the-fly to %s (%d bytes)", h.fileType, h.name, strings.ToUpper(targetFileType), fileSize)
@@ -1615,8 +1646,8 @@ func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 	// 1. Inspect page count
 	pageCount := 1
 	if targetFileType == "pdf" && fileSize > 0 {
-		if _, err := h.tmpFile.Seek(0, io.SeekStart); err == nil {
-			dims, pErr := converter.GetPDFPageDims(ctx, h.tmpFile)
+		if _, err := src.Seek(0, io.SeekStart); err == nil {
+			dims, pErr := converter.GetPDFPageDims(ctx, src)
 			if pErr == nil && len(dims) > 0 {
 				pageCount = len(dims)
 			} else {
@@ -1649,12 +1680,12 @@ func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 			return syscall.EIO
 		}
 
-		if _, sErr := h.tmpFile.Seek(0, io.SeekStart); sErr != nil {
+		if _, sErr := src.Seek(0, io.SeekStart); sErr != nil {
 			_ = remoteFile.Close()
 			return syscall.EIO
 		}
 
-		if _, cpErr := io.Copy(remoteFile, h.tmpFile); cpErr != nil {
+		if _, cpErr := io.Copy(remoteFile, src); cpErr != nil {
 			_ = remoteFile.Close()
 			logger.Error("Failed to stream upload to tablet for \"%s\": %v", h.name, cpErr)
 			return syscall.EIO
@@ -1773,10 +1804,11 @@ func (h *UploadFileHandle) commitLocked(ctx context.Context) syscall.Errno {
 	// 8. Generate desktop thumbnail if PDF
 	if h.syncer != nil && targetFileType == "pdf" {
 		filePath := filepath.Join(h.mountPoint, nodePath)
-		_ = h.syncer.SyncRenderedPDFThumbnail(filePath, modTime, h.tmpPath, "", nil)
+		_ = h.syncer.SyncRenderedPDFThumbnail(filePath, modTime, srcPath, "", nil)
 	}
 
 	h.committed = true
+	h.dirty = false
 	logger.Info("Successfully uploaded \"%s\" (%d pages, %d bytes) to reMarkable", h.name, pageCount, fileSize)
 	return 0
 }
