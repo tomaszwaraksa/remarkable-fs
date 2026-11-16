@@ -1,5 +1,7 @@
 # remarkable-fs
 
+> **Shared as is.** This is a personal project, published so others can use it. It doesn't take contributions: pull requests and issues are switched off, and there's no support. You're welcome to fork it under the [MIT license](LICENSE.md).
+
 A FUSE filesystem implementation in pure Go to browse and open files on a **reMarkable 2** tablet exclusively through your local network, without relying on reMarkable Cloud.
 
 Built with [`github.com/hanwen/go-fuse/v2`](https://github.com/hanwen/go-fuse), it communicates directly with the Linux kernel `/dev/fuse` interface in pure Go, **completely avoiding dependencies on `libfuse` C libraries or CGO**.
