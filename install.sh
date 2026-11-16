@@ -19,7 +19,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RELEASE_DIR="$SCRIPT_DIR/release"
+RELEASE_DIR="$SCRIPT_DIR/release"   # distro scripts, and a developer's own build (./build.sh)
+BUILD_DIR="$RELEASE_DIR"            # the program to install: release/, or a downloaded release
+DOWNLOAD_DIR=""                     # the temporary folder of a downloaded release, removed at the end
 
 APP_NAME="remarkable-fs"
 BIN_PATH="$HOME/.local/bin/$APP_NAME"
@@ -41,6 +43,8 @@ USB_HOST="${RMFS_TEST_USB_HOST:-10.11.99.1}"
 TABLET_PORT="${RMFS_TEST_PORT:-22}"
 OUR_MOUNT_TYPE="${RMFS_TEST_MOUNT_TYPE:-fuse.$APP_NAME}"   # what the kernel calls our mounts
 TABLET_USER="root"
+# Where releases are downloaded from when release/ has no build of its own.
+DOWNLOAD_URL="${RMFS_TEST_DOWNLOAD_URL:-https://github.com/tomaszwaraksa/remarkable-fs/releases/latest/download}"
 
 # Host key options come from host_key_options (see "Tablet identity" below).
 SSH_OPTIONS=(-o LogLevel=ERROR -p "$TABLET_PORT")
@@ -298,31 +302,70 @@ preflight() {
 
 BINARY_CHANGED=0   # set when a new or different program was installed; step 7 restarts the service
 
-release_binary() {   # prints the path of the prebuilt program for this computer
-    local machine arch
+machine_arch() {   # prints this computer's kind as named in the release files
+    local machine
     machine="$(uname -m)"
     case "$machine" in
-        x86_64)        arch="amd64" ;;
-        aarch64|arm64) arch="arm64" ;;
+        x86_64)        echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
         *) die "remarkable-fs isn't available for this kind of computer ($machine) yet. It runs on 64-bit Intel/AMD and ARM computers." ;;
     esac
-    printf '%s\n' "$RELEASE_DIR/$APP_NAME-linux-$arch"
+}
+
+release_binary() {   # prints the path of the prebuilt program for this computer
+    printf '%s\n' "$BUILD_DIR/$APP_NAME-linux-$(machine_arch)"
 }
 
 release_version() {
-    cat "$RELEASE_DIR/VERSION" 2>/dev/null || echo "unknown version"
+    cat "$BUILD_DIR/VERSION" 2>/dev/null || echo "unknown version"
 }
 
-# Makes sure a file from release/ is complete and exactly what build.sh produced.
+has_local_build() {   # a developer ran ./build.sh: release/ has a program for this computer
+    [ -f "$RELEASE_DIR/$APP_NAME-linux-$(machine_arch)" ]
+}
+
+fetch() {   # fetch URL [FILE]: downloads URL into FILE, or prints it
+    local out="${2:--}"
+    if command -v curl >/dev/null; then
+        curl -fsSL --connect-timeout 10 -o "$out" "$1"
+    elif command -v wget >/dev/null; then
+        wget -q -T 10 -O "$out" "$1"
+    else
+        return 127
+    fi
+}
+
+latest_version() {   # prints the version of the latest release, or nothing (offline)
+    fetch "$DOWNLOAD_URL/VERSION" 2>/dev/null | head -n 1 || true
+}
+
+# Downloads the latest release into a temporary folder and uses it instead of release/.
+download_release() {
+    [ "$BUILD_DIR" = "$RELEASE_DIR" ] || return 0   # already downloaded
+    command -v curl >/dev/null || command -v wget >/dev/null \
+        || die "Downloading remarkable-fs needs 'curl' or 'wget'. Please install one of them (e.g. sudo apt install curl) and run the installer again."
+    local dir file
+    dir="$(mktemp -d)"
+    DOWNLOAD_DIR="$dir"
+    say "Downloading remarkable-fs from GitHub..."
+    for file in "$APP_NAME-linux-$(machine_arch)" SHA256SUMS VERSION configuration.yaml; do
+        fetch "$DOWNLOAD_URL/$file" "$dir/$file" 2>/dev/null \
+            || die "Couldn't download remarkable-fs ($file) from GitHub. Please check the internet connection and run the installer again."
+    done
+    BUILD_DIR="$dir"
+}
+
+# Makes sure a file of the build is complete and exactly what build.sh produced.
 verify_release_file() {   # verify_release_file PATH
-    local file="$1" name expected
-    name="${file#"$RELEASE_DIR"/}"
+    local file="$1" name expected again="Run ./build.sh again."
+    name="${file#"$BUILD_DIR"/}"
+    [ "$BUILD_DIR" = "$RELEASE_DIR" ] || again="Please run the installer again to download it once more."
     [ -f "$file" ] || die "$name is missing from the release folder. Run ./build.sh first, or download the installer again."
 
-    expected="$(awk -v n="$name" 'length($1) == 64 && substr($0, 67) == n' "$RELEASE_DIR/SHA256SUMS" 2>/dev/null || true)"
-    [ -n "$expected" ] || die "Can't check $name: its checksum is missing from $RELEASE_DIR/SHA256SUMS. Run ./build.sh again."
-    (cd "$RELEASE_DIR" && printf '%s\n' "$expected" | sha256sum --check --quiet --status) \
-        || die "$name in the release folder looks damaged or changed (checksum mismatch). Run ./build.sh again, or download the installer again."
+    expected="$(awk -v n="$name" 'length($1) == 64 && substr($0, 67) == n' "$BUILD_DIR/SHA256SUMS" 2>/dev/null || true)"
+    [ -n "$expected" ] || die "Can't check $name: its checksum is missing. $again"
+    (cd "$BUILD_DIR" && printf '%s\n' "$expected" | sha256sum --check --quiet --status) \
+        || die "$name looks damaged or changed (checksum mismatch). $again"
 }
 
 file_hash() {   # file_hash PATH: prints the SHA-256 of PATH
@@ -348,6 +391,7 @@ warn_if_not_on_path() {
 install_binary() {
     local binary
     heading "Installing the program"
+    has_local_build || download_release
     binary="$(release_binary)"
     verify_release_file "$binary"
 
@@ -922,9 +966,9 @@ write_config() {
     if [ -e "$CONFIG_FILE" ]; then
         before="$(file_hash "$CONFIG_FILE")"
     else
-        verify_release_file "$RELEASE_DIR/configuration.yaml"
+        verify_release_file "$BUILD_DIR/configuration.yaml"
         run mkdir -p -m 700 "$CONFIG_DIR"
-        run install -m 600 "$RELEASE_DIR/configuration.yaml" "$CONFIG_FILE"
+        run install -m 600 "$BUILD_DIR/configuration.yaml" "$CONFIG_FILE"
     fi
     set_config_key host "$TABLET_HOST"
     set_config_key ssh_key "$(pretty_path "$KEY_PATH")"
@@ -1133,10 +1177,19 @@ last_connection_event() {
         "$log" | tail -n 1
 }
 
+installed_version() {   # prints the installed program's version, or nothing (older programs can't tell)
+    "$BIN_PATH" --version 2>/dev/null | awk 'NR == 1 { print $2 }' || true
+}
+
 status_program() {
     local found
     if [ ! -x "$BIN_PATH" ]; then
         status_line "Program" bad "not installed"
+    elif ! has_local_build; then
+        local version
+        version="$(installed_version)"
+        [ -n "$version" ] || version="(an older version that can't tell its number)"
+        status_line "Program" good "remarkable-fs $version"
     elif binary_differs; then
         status_line "Program" info "installed; release/ has a different version ($(release_version))"
     else
@@ -1321,11 +1374,21 @@ is_fully_set_up() {
     [ -x "$BIN_PATH" ] && [ -f "$UNIT_PATH" ] && [ -r "$CONFIG_FILE" ] && service_active
 }
 
-# On a working setup: offer the program from release/ when it differs from the installed one.
+# On a working setup: offer the program from release/ when it differs from the installed one,
+# or, without a build of our own, the latest release when it's newer than the installed one.
 offer_update() {
-    binary_differs || return 0
-    say ""
-    say "release/ has a different version of remarkable-fs ($(release_version)) than the installed one."
+    if has_local_build; then
+        binary_differs || return 0
+        say ""
+        say "release/ has a different version of remarkable-fs ($(release_version)) than the installed one."
+    else
+        local latest installed
+        latest="$(latest_version)"
+        installed="$(installed_version)"
+        is_newer_release "$latest" "$installed" || return 0
+        say ""
+        say "A newer version of remarkable-fs is available: $latest (you have ${installed:-an older one})."
+    fi
     if [ "$ASSUME_YES" -eq 0 ] && ! has_terminal; then
         say "Run ./install.sh in a terminal to update."
         return 0
@@ -1338,6 +1401,17 @@ offer_update() {
         wait_for_mount
         show_status || true
     fi
+}
+
+# is_newer_release LATEST INSTALLED: LATEST is a release (v1.2.3) newer than INSTALLED. A
+# developer build installed (a git commit, "dev") is never replaced by a release this way;
+# a program too old to tell its version is.
+is_newer_release() {
+    local release='^v[0-9]+(\.[0-9]+)*$'
+    [[ "$1" =~ $release ]] || return 1
+    [ -n "$2" ] || return 0
+    [[ "$2" =~ $release ]] || return 1
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -1472,6 +1546,7 @@ main() {
     parse_flags "$@"
     require_linux
     require_regular_user
+    trap '[ -z "$DOWNLOAD_DIR" ] || rm -rf "$DOWNLOAD_DIR"' EXIT
     trap 'printf "\n"; [ -z "$UPLOAD_LOG" ] || rm -f "$UPLOAD_LOG"; die "Stopped. Whatever was done so far stays; run the installer again any time to continue."' INT
 
     if [ "$SHOW_STATUS" -eq 1 ]; then

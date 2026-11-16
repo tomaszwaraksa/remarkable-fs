@@ -1,5 +1,9 @@
 # Binaries
 /remarkable-fs
+
+# Build output (./build.sh); releases are downloads on GitHub. Only the distro scripts are kept.
+/release/*
+!/release/scripts/
 *.exe
 *.test
 

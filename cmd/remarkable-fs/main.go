@@ -21,6 +21,10 @@ import (
 	"remarkable-fs/internal/sshclient"
 )
 
+// version is stamped in by build.sh (-ldflags "-X main.version=..."): the release tag, or the
+// git commit for a developer build. "dev" for a plain go build.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -43,7 +47,12 @@ func run() error {
 	textFormatFlag := flag.String("text-format", "", "Alias for --converter ('epub' or 'pdf')")
 	pdfPageSizeFlag := flag.String("pdf-page-size", "", "PDF page size preset ('remarkable', 'a4', 'a5', 'letter', 'legal', or 'custom')")
 	pdfOrientationFlag := flag.String("pdf-orientation", "", "PDF page orientation ('portrait' or 'landscape')")
+	versionFlag := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
+	if *versionFlag {
+		fmt.Println("remarkable-fs " + version)
+		return nil
+	}
 
 	// 2. Load configuration from ~/.config/remarkable-fs/configuration.yaml
 	cfg, configPath, err := config.LoadConfig(*configFlag)
@@ -92,7 +101,7 @@ func run() error {
 	}
 	defer logInstance.Close()
 
-	logger.Info("Starting remarkable-fs...")
+	logger.Info("Starting remarkable-fs... (version %s)", version)
 
 	// 6. Resolve reMarkable host
 	targetHost := *hostFlag

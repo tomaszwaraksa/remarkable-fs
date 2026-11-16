@@ -49,7 +49,7 @@ for arch in "${arches[@]}"; do
     out="$RELEASE_DIR/$NAME-linux-$arch"
     echo "Building $out"
     CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-        go build -trimpath -ldflags "-s -w" -o "$out" "$PACKAGE"
+        go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$out" "$PACKAGE"
 done
 
 for old in "$RELEASE_DIR/$NAME"-linux-*; do

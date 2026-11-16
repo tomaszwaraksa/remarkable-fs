@@ -26,9 +26,12 @@ Built with [`github.com/hanwen/go-fuse/v2`](https://github.com/hanwen/go-fuse), 
 On Linux, an interactive installer sets everything up. It checks that the needed tools are installed and offers to install them, creates a key for the tablet, and connects to the tablet. If needed, it walks you through a one-time USB connection. Finally it runs remarkable-fs as a background service that starts by itself when you log in.
 
 ```bash
+git clone https://github.com/tomaszwaraksa/remarkable-fs.git
 cd remarkable-fs
 ./install.sh
 ```
+
+(Or download the source code of the [latest release](https://github.com/tomaszwaraksa/remarkable-fs/releases/latest) and run `./install.sh` in it.) The installer downloads the program for your computer from the latest release and checks it before installing. Run `./install.sh` again later to see the status; it offers newer releases when there are any. If you built the program yourself (see [Build](#build)), the installer uses your build instead.
 
 Your tablet then appears in `~/remarkable` (you can pick another folder during setup).
 
@@ -120,11 +123,13 @@ Compile using Go 1.26+:
 go build -o remarkable-fs ./cmd/remarkable-fs
 ```
 
-Or build the release used by the installer: static binaries for amd64 and arm64, checksums, version, and the config template, all in `release/`:
+Or build what the installer installs: static binaries for amd64 and arm64, checksums, version, and the config template, all in `release/`. The installer then uses this build instead of downloading a release:
 
 ```bash
 ./build.sh              # runs the tests first; --skip-tests to skip them
 ```
+
+`remarkable-fs --version` tells which version is installed: the release (e.g. `v0.1.0`), or the git commit it was built from.
 
 ---
 
@@ -172,6 +177,8 @@ Usage of ./remarkable-fs:
         Custom configuration file path (default: ~/.config/remarkable-fs/configuration.yaml)
   -log string
         Log file path (default: ~/.config/remarkable-fs/log.txt)
+  -version
+        Print the version and exit
 ```
 
 ---
