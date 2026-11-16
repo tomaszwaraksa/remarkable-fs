@@ -83,8 +83,8 @@ func TestMountWhileOfflineThenAttachTree(t *testing.T) {
 		t.Errorf("Expected the offline folder to be read-only (0555), got %v", info.Mode().Perm())
 	}
 	entries, err := os.ReadDir(mountDir)
-	if err != nil || len(entries) != 0 {
-		t.Errorf("Expected an empty folder while offline, got %v (err %v)", entries, err)
+	if err != nil || len(entries) != 1 || entries[0].Name() != trackerIgnoreName {
+		t.Errorf("Expected an empty folder (only %s) while offline, got %v (err %v)", trackerIgnoreName, entries, err)
 	}
 	if err := os.WriteFile(filepath.Join(mountDir, "notes.txt"), []byte("x"), 0644); !errors.Is(err, syscall.EROFS) {
 		t.Errorf("Expected EROFS when saving while offline, got %v", err)

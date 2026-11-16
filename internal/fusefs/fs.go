@@ -64,6 +64,50 @@ func (t *TrashBlockNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	return nil, 0, 0
 }
 
+// trackerIgnoreName is a hidden, empty, read-only file at the mount root. GNOME's search indexer
+// (Tracker / LocalSearch) skips folders that contain it, so it never downloads and renders every
+// document over Wi-Fi. It exists only in this filesystem, never on the tablet.
+const trackerIgnoreName = ".trackerignore"
+
+// isRootMarker reports whether name in dir d is the virtual .trackerignore.
+func isRootMarker(d *DirNode, name string) bool {
+	return d.virtualPath == "/" && name == trackerIgnoreName
+}
+
+// MarkerFileNode is an empty, read-only regular file that exists only in this filesystem.
+type MarkerFileNode struct {
+	fs.Inode
+}
+
+var _ fs.NodeGetattrer = (*MarkerFileNode)(nil)
+var _ fs.NodeSetattrer = (*MarkerFileNode)(nil)
+var _ fs.NodeOpener = (*MarkerFileNode)(nil)
+var _ fs.NodeReader = (*MarkerFileNode)(nil)
+
+func (m *MarkerFileNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.Mode = fuse.S_IFREG | 0444
+	out.Uid = uint32(os.Getuid())
+	out.Gid = uint32(os.Getgid())
+	out.Size = 0
+	return 0
+}
+
+// Setattr refuses changes (truncate, chmod, touch): the file is fixed.
+func (m *MarkerFileNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	return syscall.EPERM
+}
+
+func (m *MarkerFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_TRUNC|syscall.O_APPEND) != 0 {
+		return nil, 0, syscall.EPERM
+	}
+	return nil, 0, 0
+}
+
+func (m *MarkerFileNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	return fuse.ReadResultData(nil), 0
+}
+
 var _ fs.NodeOnAdder = (*DirNode)(nil)
 var _ fs.NodeGetattrer = (*DirNode)(nil)
 var _ fs.NodeReaddirer = (*DirNode)(nil)
@@ -86,6 +130,9 @@ func (d *DirNode) OnAdd(ctx context.Context) {
 			chInode := d.NewPersistentInode(ctx, blockNode, fs.StableAttr{Mode: fuse.S_IFREG})
 			d.AddChild(trashName, chInode, false)
 		}
+		// Unlike the .Trash files, .trackerignore is listed too: the indexer looks for it in listings.
+		marker := d.NewPersistentInode(ctx, &MarkerFileNode{}, fs.StableAttr{Mode: fuse.S_IFREG})
+		d.AddChild(trackerIgnoreName, marker, false)
 	}
 
 	d.attachChildren(ctx)
@@ -274,7 +321,7 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	if d.isOffline() {
 		return syscall.EROFS
 	}
-	if name == ".Trash" || strings.HasPrefix(name, ".Trash-") {
+	if name == ".Trash" || strings.HasPrefix(name, ".Trash-") || isRootMarker(d, name) {
 		return syscall.EPERM
 	}
 
@@ -396,7 +443,7 @@ func (d *DirNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse
 	if d.isOffline() {
 		return nil, syscall.EROFS
 	}
-	if d.virtualPath == "/" && name == "Recent" {
+	if d.virtualPath == "/" && (name == "Recent" || name == trackerIgnoreName) {
 		return nil, syscall.EEXIST
 	}
 	if strings.HasPrefix(name, ".") {
@@ -496,6 +543,9 @@ func (d *DirNode) Create(ctx context.Context, name string, flags uint32, mode ui
 	if name == ".Trash" || strings.HasPrefix(name, ".Trash-") {
 		return nil, nil, 0, syscall.EPERM
 	}
+	if isRootMarker(d, name) {
+		return nil, nil, 0, syscall.EEXIST
+	}
 
 	fileType, isDoc := isSupportedDocumentExtension(name)
 	isTemp := isTemporaryUploadName(name)
@@ -587,6 +637,9 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 		return syscall.EPERM
 	}
 	if strings.HasPrefix(targetDir.virtualPath, "/.Trash") || strings.HasPrefix(newName, ".Trash") {
+		return syscall.EPERM
+	}
+	if isRootMarker(d, name) || isRootMarker(targetDir, newName) {
 		return syscall.EPERM
 	}
 
@@ -764,8 +817,9 @@ func (d *DirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 // Readdir streams directory contents and logs the user action.
 func (d *DirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	if d.isOffline() {
-		// The tree is still being read (or the tablet hasn't been reached yet): show it empty.
-		return fs.NewListDirStream(nil), 0
+		// The tree is still being read (or the tablet hasn't been reached yet): show it empty,
+		// except for .trackerignore, so the indexer skips the folder from the start.
+		return fs.NewListDirStream(d.markerEntries()), 0
 	}
 	triggerBackgroundSync(d.repo, d.client, d.syncer, d.mountPoint)
 
@@ -788,7 +842,7 @@ func (d *DirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 	logger.Action("Browsed folder: \"%s\" (%d items)", d.virtualPath, len(children))
 
-	var entries []fuse.DirEntry
+	entries := d.markerEntries()
 	for _, child := range children {
 		mode := uint32(fuse.S_IFREG)
 		if child.IsDir {
@@ -801,6 +855,14 @@ func (d *DirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	}
 	d.attachChildren(ctx)
 	return fs.NewListDirStream(entries), 0
+}
+
+// markerEntries lists the virtual files shown in this folder: .trackerignore at the root.
+func (d *DirNode) markerEntries() []fuse.DirEntry {
+	if d.virtualPath != "/" {
+		return nil
+	}
+	return []fuse.DirEntry{{Mode: fuse.S_IFREG, Name: trackerIgnoreName}}
 }
 
 // FileNode represents a document or notebook file in the FUSE filesystem.

@@ -73,7 +73,7 @@ func TestFUSEMountAndRead(t *testing.T) {
 	}
 
 	// Read root directory entries
-	entries, err := os.ReadDir(mountDir)
+	entries, err := readDocuments(mountDir)
 	if err != nil {
 		t.Fatalf("Failed to read mount directory: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestFUSEMountAndRead(t *testing.T) {
 		t.Fatalf("Failed to remove Guide.notebook: %v", err)
 	}
 
-	entriesAfterUnlink, err := os.ReadDir(mountDir)
+	entriesAfterUnlink, err := readDocuments(mountDir)
 	if err != nil {
 		t.Fatalf("Failed to read mount directory after unlink: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestFUSEMountAndRead(t *testing.T) {
 		t.Fatalf("Failed to remove empty folder My Notes: %v", err)
 	}
 
-	entriesFinal, err := os.ReadDir(mountDir)
+	entriesFinal, err := readDocuments(mountDir)
 	if err != nil {
 		t.Fatalf("Failed to read mount directory after all deletes: %v", err)
 	}

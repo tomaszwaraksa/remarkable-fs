@@ -76,7 +76,11 @@ Your tablet then appears in `~/remarkable` (you can pick another folder during s
 
 **Several computers:** you can set up remarkable-fs on several computers for the same tablet, e.g. a workstation and a laptop. They take turns when they change documents or refresh the tablet's screen, and each one sees the others' changes the next time it lists a folder. On one computer only one copy runs at a time: a second one, e.g. started by hand next to the service, refuses to start and names the one that's running.
 
-The installer uses the prebuilt programs in `release/`. After changing the code, run `./build.sh`, then `./install.sh` to update.
+**Search and backups:** to a search indexer or a backup tool, `~/remarkable` looks like a normal folder, but reading a document there means downloading and rendering it from the tablet, over Wi-Fi. remarkable-fs shows a hidden `.trackerignore` file in the folder, so GNOME's search (Tracker / LocalSearch) skips it by itself. Other tools need to be told:
+- **Backups:** exclude `~/remarkable`, or tell the tool to stay on one file system (`rsync -x`, `tar --one-file-system`, `borg create --one-file-system`; Déjà Dup: add the folder under *Folders to Ignore*).
+- **KDE search (Baloo):** System Settings → Search → File Search, add `~/remarkable` to the excluded folders.
+
+When you build the program yourself (`./build.sh`), the installer uses that build from `release/` instead of downloading a release. After changing the code, run `./build.sh`, then `./install.sh` to update.
 
 ---
 
