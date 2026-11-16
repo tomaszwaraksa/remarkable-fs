@@ -1,0 +1,3 @@
+#!/bin/sh
+# test-only: in a user namespace, system ssh config looks foreign-owned
+exec /usr/bin/ssh -F /dev/null "$@"

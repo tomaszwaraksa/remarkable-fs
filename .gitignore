@@ -1,0 +1,14 @@
+# Binaries
+/remarkable-fs
+*.exe
+*.test
+
+# OS & IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+log.txt
+
+TODO.md

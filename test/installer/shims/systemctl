@@ -1,0 +1,16 @@
+#!/bin/bash
+# Stand-in for systemctl --user: records calls; "restart" acts per SHIM_MODE.
+state="$SHIM_DIR/state"; echo "systemctl $*" >> "$SHIM_DIR/calls"
+args=" $* "
+case "$args" in
+  *" show-environment "*) exit 0 ;;
+  *" is-active "*) [ "$(cat "$state" 2>/dev/null)" = active ] ;;
+  *" disable "*"--now"*|*" stop "*) umount -l "$SHIM_MOUNT" 2>/dev/null; echo inactive > "$state" ;;
+  *" restart "*)
+      case "$SHIM_MODE" in
+        mount) mkdir -p "$SHIM_MOUNT" && mount -t tmpfs remarkable-fs "$SHIM_MOUNT"; echo active > "$state" ;;
+        crash) echo failed > "$state" ;;
+        asleep) mkdir -p "$SHIM_MOUNT" && mount -t tmpfs -o mode=555 remarkable-fs "$SHIM_MOUNT"; echo active > "$state" ;;   # like the daemon: empty, read-only
+      esac ;;
+  *) exit 0 ;;
+esac

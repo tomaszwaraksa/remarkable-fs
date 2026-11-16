@@ -1,0 +1,60 @@
+# reMarkable FUSE Filesystem Default Configuration
+# Target tablet host (e.g. remarkable.local or 192.168.x.x)
+host: "remarkable.local"
+
+# Fallback candidate hosts for automatic reconnection (Wi-Fi and USB)
+fallback_hosts:
+  - "remarkable.local"
+  - "10.11.99.1"
+
+# SSH port (default: 22)
+port: 22
+
+# SSH username (default: root)
+user: "root"
+
+# Optional path to specific SSH private key (if not using default ~/.ssh/ keys)
+# ssh_key: "~/.ssh/id_ed25519"
+
+# Switch on SSH over Wi-Fi on the tablet each time remarkable-fs connects
+# (firmware 3.22+ ships with it off). Set to false to leave the tablet's setting
+# alone; remarkable-fs then works over Wi-Fi only if you switched it on yourself.
+enable_wifi_ssh: true
+
+# Default mount point
+mount_point: "~/remarkable"
+
+# Activity log file path
+log_file: "~/.config/remarkable-fs/log.txt"
+
+# Maximum upload size in megabytes (default: 200 MB, set to -1 for unlimited)
+max_upload_size_mb: 200
+
+# Target format for converting plain text (.txt) and Markdown (.md) uploads.
+# Options: "epub" (recommended for reflowable e-reader experience) or "pdf" (fixed vector layout)
+converter: "epub"
+
+# PDF formatting options (active when converter is set to "pdf")
+pdf:
+  # Preset page dimensions: "remarkable" (default: 158x210mm / native tablet ratio), "a4", "a5", "letter", "legal", or "custom"
+  page_size: "remarkable"
+
+  # Page orientation: "portrait" (default) or "landscape"
+  orientation: "portrait"
+
+  # Custom page dimensions in millimeters (used when page_size is "custom")
+  # page_width_mm: 157.99
+  # page_height_mm: 210.27
+
+  # Margins in millimeters
+  margins:
+    top: 18.0
+    bottom: 16.0
+    left: 16.0
+    right: 16.0
+
+  # Typography settings
+  font_size: 10.0      # Base body font size in points (default: 10.0)
+  line_height: 5.2    # Body line height in millimeters (default: 5.2)
+  code_font_size: 8.5 # Monospace font size in points (default: 8.5)
+

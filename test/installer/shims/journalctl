@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "journalctl $*" >> "$SHIM_DIR/calls"
+echo "[remarkable-fs] Error: SSH connection to remarkable.local:22 failed: unable to authenticate"
